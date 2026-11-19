@@ -1,72 +1,129 @@
-// main.ts — the token launch radar's entrypoint (Node 22, standard library only).
+// main.ts — the token launch radar's driver: one sealed snapshot in, one ranked board and one
+// dashboard out.
 //
-// Reads one sealed DefiLlama snapshot, ranks its pre-token protocols by implied token value
-// (lib/model.ts, radar-2), checks the board against the gate's invariants (lib/validate.ts),
-// and writes the entry's output: board.json, data.js and dossier.json, with dashboard/ and
-// screenshots/ copied alongside so the dossier is built from exactly what ships.
+//   node main.ts --input ../token-radar-01-kit/input/snapshot.json
+//   MAKEFUN_OUTPUT_DIR=out node main.ts --input snapshot.json
 //
-//   node main.ts --input <snapshot.json>
-//   MAKEFUN_OUTPUT_DIR=<dir> node main.ts --input <snapshot.json>
+// The input is the sealed snapshot (758 DefiLlama protocols as of 2026-11-14); the output is a
+// directory with board.json, data.js, dashboard/ and screenshots/, plus the dossier.json the
+// scorer compares byte for byte. The model lives in lib/model.ts, the gate's checks in
+// lib/validate.ts, the dossier writer in vendor/makefun-board.ts; this file only drives them:
+// read the snapshot, score it, check the board, write the files, check the files back.
 //
-// The input defaults to /input/snapshot.json and the output to /output, the sandbox's paths;
-// locally both are given on the command line. The run is deterministic: the same snapshot
-// always writes the same bytes, so the sandbox's two runs agree.
+// Nothing here is random and nothing reads the clock, so two runs over the same snapshot write
+// the same bytes. A broken snapshot or a broken board stops the program with a message on
+// stderr and a non-zero exit, before anything is submitted.
 
 import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildRadar, dataScript, parseSnapshot, MODEL } from './lib/model.ts';
-import { validateBoard } from './lib/validate.ts';
-import { buildDossier } from './vendor/makefun-board.ts';
 
-/** The dossier's text cap in UTF-8 bytes (competition.yaml). */
+import { buildDossier } from './vendor/makefun-board.ts';
+import { buildRadar, dataScript, parseSnapshot, type Snapshot } from './lib/model.ts';
+import { validateBoard, validateOutputs, validateSnapshotShape } from './lib/validate.ts';
+
+/** The sealed snapshot's path when no --input is given (the sandbox mounts it here). */
+const DEFAULT_INPUT = '/input/snapshot.json';
+/** The output directory when MAKEFUN_OUTPUT_DIR is unset (the sandbox writes here). */
+const DEFAULT_OUTPUT = '/output';
+/** The dashboard source the judge reads, in UTF-8 bytes (competition.yaml). */
 const TEXT_MAX_BYTES = 65536;
 
-/** The input's path from --input, or the sandbox's sealed snapshot when it is not given. */
-function inputPath(argv: string[]): string {
-  let positional: string | null = null;
+/** The command line's input path: --input <path>, --input=<path>, or a positional path. */
+function parseInput(argv: string[]): string {
+  let input: string | undefined;
+  let positional: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '--input') {
-      if (i + 1 >= argv.length) throw new Error('--input needs a path');
-      return argv[i + 1]!;
+      const value = argv[++i];
+      if (value === undefined) throw new Error('--input needs a path after it');
+      input = value;
+    } else if (arg.startsWith('--input=')) {
+      input = arg.slice('--input='.length);
+    } else if (arg === '--help' || arg === '-h') {
+      process.stdout.write('usage: node main.ts [--input <snapshot.json>] [snapshot.json]\n');
+      process.exit(0);
+    } else if (arg.startsWith('-')) {
+      throw new Error(`unknown option ${arg}`);
+    } else if (positional === undefined) {
+      positional = arg;
     }
-    if (arg.startsWith('--input=')) return arg.slice('--input='.length);
-    if (arg.startsWith('--input')) return arg.slice('--input'.length);
-    if (!arg.startsWith('-') && positional === null) positional = arg;
   }
-  return positional ?? '/input/snapshot.json';
+  return input ?? positional ?? DEFAULT_INPUT;
 }
 
-/** The output directory from the environment, or the sandbox's /output. */
-function outputDir(): string {
-  return resolve(process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
+/** Stop with a message on stderr and a non-zero exit: a broken run must not look like a success. */
+function fail(message: string): never {
+  process.stderr.write(`main.ts: ${message}\n`);
+  process.exit(1);
+}
+
+/** The directory this file lives in: dashboard/ and screenshots/ sit beside it. */
+function scriptDir(): string {
+  return dirname(fileURLToPath(import.meta.url));
+}
+
+/** Read the snapshot file's text, or stop with a message that names the path. */
+function readInput(path: string): string {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    fail(`cannot read the snapshot at ${path}`);
+  }
+}
+
+/** Copy one directory tree into the output, or stop with a message that names it. */
+function copyTree(from: string, to: string): void {
+  try {
+    cpSync(from, to, { recursive: true });
+  } catch {
+    fail(`cannot copy ${from} to ${to}`);
+  }
 }
 
 function main(): void {
-  const input = resolve(inputPath(process.argv.slice(2)));
-  const out = outputDir();
-  const root = dirname(fileURLToPath(import.meta.url));
-  const snapshot = parseSnapshot(readFileSync(input, 'utf8'));
-  const { board, radar } = buildRadar(snapshot, MODEL);
-  const issue = validateBoard(board, snapshot);
-  if (issue !== null) {
-    console.error(`main.ts: board invalid: ${issue}`);
-    process.exit(1);
+  let inputPath: string;
+  try {
+    inputPath = parseInput(process.argv.slice(2));
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
   }
-  mkdirSync(out, { recursive: true });
-  writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`, 'utf8');
-  writeFileSync(join(out, 'data.js'), dataScript(radar), 'utf8');
-  cpSync(join(root, 'dashboard'), join(out, 'dashboard'), { recursive: true });
-  cpSync(join(root, 'screenshots'), join(out, 'screenshots'), { recursive: true });
-  const dossier = buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES });
-  writeFileSync(join(out, 'dossier.json'), dossier);
-  console.log(`main.ts: ${board.length} rows, ${radar.live_size} live, dossier ${dossier.length} bytes -> ${out}`);
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? DEFAULT_OUTPUT;
+  const root = scriptDir();
+
+  let snapshot: Snapshot;
+  try {
+    snapshot = parseSnapshot(readInput(inputPath));
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
+  const shapeIssue = validateSnapshotShape(snapshot);
+  if (shapeIssue !== null) fail(`snapshot shape: ${shapeIssue}`);
+
+  const { board, radar } = buildRadar(snapshot);
+  const boardIssue = validateBoard(board, snapshot);
+  if (boardIssue !== null) fail(`board: ${boardIssue}`);
+
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, 'board.json'), `${JSON.stringify({ rows: board })}\n`, 'utf8');
+  writeFileSync(join(outDir, 'data.js'), dataScript(radar), 'utf8');
+  copyTree(join(root, 'dashboard'), join(outDir, 'dashboard'));
+  copyTree(join(root, 'screenshots'), join(outDir, 'screenshots'));
+  let dossier: Uint8Array;
+  try {
+    dossier = buildDossier(outDir, { text_max_bytes: TEXT_MAX_BYTES });
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
+  writeFileSync(join(outDir, 'dossier.json'), dossier);
+
+  const outputIssue = validateOutputs(outDir, board, radar);
+  if (outputIssue !== null) fail(`output: ${outputIssue}`);
+
+  process.stdout.write(
+    `wrote ${board.length} rows (${radar.watchlist_size} watchlist, ${radar.early_size} early) to ${outDir} (dossier ${dossier.length} bytes)\n`,
+  );
 }
 
-try {
-  main();
-} catch (err) {
-  console.error(`main.ts: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-}
+main();

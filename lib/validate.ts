@@ -1,12 +1,19 @@
-// lib/validate.ts — the board's invariants, checked in memory before main.ts writes anything.
+// lib/validate.ts — the board's invariants, checked in memory before main.ts writes anything,
+// and the files it wrote, checked back against that memory after.
 //
 // Every check here is one the gate runs on board.json, restated against the board in memory so a
 // broken board stops the program with a message instead of a rejected entry. The checks are the
 // gate's own: row count, ranks, order, one shared value, watchlist coverage, rows outside the
-// watchlist, and farm steps. Nothing here reads a file and nothing here writes one; it only
-// answers whether a board is one the gate will take.
+// watchlist, and farm steps. validateSnapshotShape checks the snapshot's own shape a second time
+// after parsing, and validateOutputs reads the written board.json, data.js and dossier.json back
+// and answers whether they carry exactly the board and radar the program built; nothing here
+// writes a file.
 
-import { isEarlyRankable, type BoardRow, type Snapshot } from './model.ts';
+import { readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { DOSSIER_MAX_BYTES, DOSSIER_SCHEMA } from '../vendor/makefun-board.ts';
+import { isEarlyRankable, type BoardRow, type RadarData, type Snapshot } from './model.ts';
 
 /** The gate's row bounds for board.json (competition.yaml). */
 const MIN_ROWS = 100;
@@ -90,4 +97,131 @@ function expectedRows(snapshot: Snapshot): number {
     if (!watch.has(p.slug) && isEarlyRankable(p)) n++;
   }
   return n;
+}
+
+/**
+ * The snapshot's own shape, checked a second time after parsing: parseSnapshot refuses a
+ * document that is not JSON or lacks its top-level fields, and this refuses one whose
+ * protocols are not shaped the model can score — an empty slug or name, a negative TVL,
+ * a chain that is an empty string, a listed_at that is not a YYYY-MM-DD date,
+ * a slug listed twice, or a watchlist naming a slug the snapshot does not carry. A negative
+ * market cap is not refused: the snapshot carries one (autofinance records -1, a data quirk
+ * for an unknown cap) and the model scores it as recorded.
+ */
+export function validateSnapshotShape(snapshot: Snapshot): string | null {
+  if (snapshot.protocols.length === 0) return 'the snapshot carries no protocols';
+  if (snapshot.watchlist.length === 0) return 'the snapshot carries an empty watchlist';
+  if (snapshot.floor_usd <= 0) return `the snapshot's floor_usd is ${snapshot.floor_usd}, not positive`;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshot.as_of)) {
+    return `the snapshot's as_of is ${snapshot.as_of}, not a YYYY-MM-DD date`;
+  }
+  const seen = new Set<string>();
+  for (let i = 0; i < snapshot.protocols.length; i++) {
+    const p = snapshot.protocols[i]!;
+    if (p.slug.length === 0) return `protocol ${i} has an empty slug`;
+    if (seen.has(p.slug)) return `the snapshot lists ${p.slug} twice`;
+    seen.add(p.slug);
+    if (p.name.length === 0) return `${p.slug} has an empty name`;
+    if (p.tvl_usd < 0) return `${p.slug} has a negative TVL of ${p.tvl_usd}`;
+    if (p.change_7d !== null && !Number.isFinite(p.change_7d)) {
+      return `${p.slug} has a non-finite change_7d`;
+    }
+    if (p.mcap_usd !== null && !Number.isFinite(p.mcap_usd)) {
+      return `${p.slug} has a non-finite mcap_usd`;
+    }
+    if (p.listed_at !== null && !/^\d{4}-\d{2}-\d{2}$/.test(p.listed_at)) {
+      return `${p.slug} has listed_at ${p.listed_at}, not a YYYY-MM-DD date`;
+    }
+    for (const chain of p.chains) {
+      if (chain.length === 0) return `${p.slug} names an empty chain`;
+    }
+  }
+  const missing = snapshot.watchlist.filter((slug) => !seen.has(slug));
+  if (missing.length > 0) {
+    return `the watchlist names ${missing.length} slug${missing.length === 1 ? '' : 's'} the snapshot does not carry: ${missing.slice(0, 5).join(', ')}`;
+  }
+  return null;
+}
+
+/** The dossier's byte cap (contracts/dossier.ts DOSSIER_MAX_BYTES): a dossier holds 4 MiB. */
+const DOSSIER_LIMIT = DOSSIER_MAX_BYTES;
+
+/**
+ * The files main.ts just wrote, read back and checked against the board and radar in memory:
+ * board.json must parse and carry exactly the board's rows, data.js must be the window.RADAR
+ * assignment carrying exactly the radar, and dossier.json must be under the byte cap, parse,
+ * and carry the dossier schema with at least one image and its dashboard text. The first
+ * problem found is the answer; null means the output on disk is the output in memory.
+ */
+export function validateOutputs(outDir: string, board: BoardRow[], radar: RadarData): string | null {
+  let boardText: string;
+  try {
+    boardText = readFileSync(join(outDir, 'board.json'), 'utf8');
+  } catch {
+    return 'board.json cannot be read back from the output directory';
+  }
+  let parsedBoard: unknown;
+  try {
+    parsedBoard = JSON.parse(boardText);
+  } catch {
+    return 'board.json does not parse as JSON after writing';
+  }
+  if (typeof parsedBoard !== 'object' || parsedBoard === null || Array.isArray(parsedBoard)) {
+    return 'board.json is not a JSON object after writing';
+  }
+  const rows = (parsedBoard as Record<string, unknown>).rows;
+  if (!Array.isArray(rows)) return 'board.json has no rows array after writing';
+  if (JSON.stringify(rows) !== JSON.stringify(board)) {
+    return `board.json's ${rows.length} rows differ from the ${board.length} rows in memory`;
+  }
+
+  let dataText: string;
+  try {
+    dataText = readFileSync(join(outDir, 'data.js'), 'utf8');
+  } catch {
+    return 'data.js cannot be read back from the output directory';
+  }
+  const prefix = 'window.RADAR=';
+  if (!dataText.startsWith(prefix) || !dataText.endsWith(';\n')) {
+    return 'data.js is not a window.RADAR assignment after writing';
+  }
+  let parsedRadar: unknown;
+  try {
+    parsedRadar = JSON.parse(dataText.slice(prefix.length, -2));
+  } catch {
+    return 'data.js does not parse as JSON after writing';
+  }
+  if (JSON.stringify(parsedRadar) !== JSON.stringify(radar)) {
+    return 'data.js carries different radar data than the radar in memory';
+  }
+
+  let dossierSize: number;
+  try {
+    dossierSize = statSync(join(outDir, 'dossier.json')).size;
+  } catch {
+    return 'dossier.json cannot be read back from the output directory';
+  }
+  if (dossierSize >= DOSSIER_LIMIT) {
+    return `dossier.json is ${dossierSize} bytes, over the ${DOSSIER_LIMIT} a dossier holds`;
+  }
+  let dossier: unknown;
+  try {
+    dossier = JSON.parse(readFileSync(join(outDir, 'dossier.json'), 'utf8'));
+  } catch {
+    return 'dossier.json does not parse as JSON after writing';
+  }
+  if (typeof dossier !== 'object' || dossier === null || Array.isArray(dossier)) {
+    return 'dossier.json is not a JSON object after writing';
+  }
+  const doc = dossier as Record<string, unknown>;
+  if (doc.schema !== DOSSIER_SCHEMA) {
+    return `dossier.json carries schema ${String(doc.schema)}, not ${DOSSIER_SCHEMA}`;
+  }
+  if (!Array.isArray(doc.images) || doc.images.length === 0) {
+    return 'dossier.json carries no images';
+  }
+  if (typeof doc.text !== 'string' || doc.text.length === 0) {
+    return 'dossier.json carries no dashboard text';
+  }
+  return null;
 }
